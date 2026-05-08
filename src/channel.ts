@@ -1,23 +1,35 @@
 import {
   buildAccountScopedDmSecurityPolicy,
 } from "openclaw/plugin-sdk";
-import { getApi as getApiFromRegistry, getAllBots } from "./registry.js";
+import { getApi as getApiFromRegistry, getApiByAccount, getAllBots } from "./registry.js";
 import { startPolling, stopPolling } from "./polling.js";
-import { rawUpload, resolveUploadType, stripMaxPrefix } from "./upload-file.js";
+import {
+  assertLocalFileAllowed,
+  fetchBufferWithLimit,
+  rawUpload,
+  resolveMaxToken,
+  resolvePositiveIntegerId,
+  resolveUploadType,
+  stripMaxPrefix,
+} from "./upload-file.js";
 import type { MaxAccountConfig, MaxChannelsConfig, MaxOutboundContext } from "./types.js";
 
 const DEFAULT_ACCOUNT_ID = "default";
 
 function requireApi(account: MaxAccountConfig | undefined) {
-  if (account?.token) {
-    const api = getApiFromRegistry(account.token);
+  if (!account) throw new Error("Max account is missing");
+
+  if (account.accountId) {
+    const api = getApiByAccount(account.accountId);
     if (api) return api;
   }
-  const allBots = getAllBots();
-  if (allBots.length > 0) {
-    return allBots[0].api;
+
+  const token = resolveMaxToken(account);
+  const api = getApiFromRegistry(token);
+  if (!api) {
+    throw new Error(`Bot not started for Max account "${account.accountId ?? DEFAULT_ACCOUNT_ID}"`);
   }
-  throw new Error("Bot not started — no API available");
+  return api;
 }
 
 export const maxChannel = {
@@ -102,8 +114,8 @@ export const maxChannel = {
     sendText: async (ctx: MaxOutboundContext) => {
       const api = requireApi(ctx.account);
       // ctx.chatId or ctx.to may contain "max:123" prefix
-      const rawId = ctx.chatId ?? (ctx as unknown as Record<string, unknown>).to as string ?? "";
-      const chatId = Number(stripMaxPrefix(String(rawId)));
+      const rawId = ctx.chatId ?? ((ctx as unknown as Record<string, unknown>).to as string | undefined) ?? "";
+      const chatId = resolvePositiveIntegerId(rawId, "Max chat id");
 
       if (ctx.messageId) {
         await api.editMessage(ctx.messageId, { text: ctx.text });
@@ -115,9 +127,10 @@ export const maxChannel = {
     },
 
     sendMedia: async (ctx: Record<string, unknown>) => {
-      const api = requireApi(ctx.account as MaxAccountConfig);
+      const account = ctx.account as MaxAccountConfig;
+      const api = requireApi(account);
       const rawId = (ctx.chatId ?? ctx.to ?? "") as string;
-      const chatId = Number(stripMaxPrefix(String(rawId)));
+      const chatId = resolvePositiveIntegerId(rawId, "Max chat id");
 
       // OpenClaw passes mediaUrl — can be a URL or a local file path
       const mediaUrl = (ctx.mediaUrl ?? ctx.url) as string | undefined;
@@ -130,14 +143,14 @@ export const maxChannel = {
       const filename = urlPath.split("/").pop() || "file";
       const ext = filename.includes(".") ? filename.split(".").pop()?.toLowerCase() : "";
 
-      // For local files pass path (preserves filename), for URLs pass buffer
       let contentType = "";
-      const source: string | Buffer = isLocalPath ? mediaUrl : await (async () => {
-        const res = await fetch(mediaUrl);
-        if (!res.ok) throw new Error(`Failed to download media: ${res.status}`);
-        contentType = res.headers.get("content-type") || "";
-        return Buffer.from(await res.arrayBuffer());
-      })();
+      const source: string | Buffer = isLocalPath
+        ? assertLocalFileAllowed(mediaUrl, account)
+        : await (async () => {
+            const downloaded = await fetchBufferWithLimit(mediaUrl, account?.maxDownloadBytes);
+            contentType = downloaded.contentType;
+            return downloaded.buffer;
+          })();
 
       const uploadType = resolveUploadType(ext ?? "", contentType);
 
@@ -161,12 +174,7 @@ export const maxChannel = {
       log?: { info: (...args: unknown[]) => void; warn: (...args: unknown[]) => void; error: (...args: unknown[]) => void };
     }) => {
       const { accountId, account, runtime, abortSignal } = ctx;
-
-      if (!account.token) {
-        throw new Error(
-          `Max not configured for account "${accountId}" (missing token)`,
-        );
-      }
+      resolveMaxToken(account);
 
       ctx.log?.info(`[${accountId}] starting Max Messenger polling`);
 
@@ -180,7 +188,7 @@ export const maxChannel = {
           };
 
       await startPolling({
-        accounts: { [accountId]: account },
+        accounts: { [accountId]: { ...account, accountId } },
         logger,
         runtime: runtime as import("openclaw/plugin-sdk").RuntimeEnv,
       });
@@ -188,14 +196,14 @@ export const maxChannel = {
       // Keep the promise pending until abort signal fires
       await new Promise<void>((resolve) => {
         if (abortSignal.aborted) {
-          stopPolling();
+          stopPolling(accountId);
           resolve();
           return;
         }
         abortSignal.addEventListener(
           "abort",
           () => {
-            stopPolling();
+            stopPolling(accountId);
             resolve();
           },
           { once: true },
