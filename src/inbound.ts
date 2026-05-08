@@ -14,7 +14,15 @@ import {
 } from "openclaw/plugin-sdk";
 import { getMaxRuntime } from "./runtime.js";
 import { getApi } from "./registry.js";
-import { rawUpload, resolveUploadType, stripMaxPrefix } from "./upload-file.js";
+import {
+  assertLocalFileAllowed,
+  fetchBufferWithLimit,
+  rawUpload,
+  resolveMaxToken,
+  resolvePositiveIntegerId,
+  resolveUploadType,
+  stripMaxPrefix,
+} from "./upload-file.js";
 import type { InboundMessage, MaxAccountConfig } from "./types.js";
 
 async function saveInboundFile(
@@ -33,6 +41,37 @@ async function saveInboundFile(
 
 const CHANNEL_ID = "max" as const;
 
+function isAllowedGroupChat(account: MaxAccountConfig, chatId: string): boolean {
+  if (!account.allowChats?.length) return true;
+  const normalizedChatId = stripMaxPrefix(chatId);
+  return account.allowChats.some((entry) => stripMaxPrefix(String(entry)) === normalizedChatId);
+}
+
+function shouldHandleGroupMessage(account: MaxAccountConfig, text: string): boolean {
+  const mode = account.respondInGroups ?? "always";
+  if (mode === "never") return false;
+  if (mode === "always") return true;
+
+  const trimmed = text.trim();
+  const prefixes = account.groupTriggerPrefixes?.length
+    ? account.groupTriggerPrefixes
+    : ["/openclaw", "/ask", "@openclaw"];
+  return prefixes.some((prefix) => trimmed === prefix || trimmed.startsWith(`${prefix} `));
+}
+
+function stripGroupCommand(account: MaxAccountConfig, text: string): string {
+  if ((account.respondInGroups ?? "always") !== "command") return text;
+  const trimmed = text.trim();
+  const prefixes = account.groupTriggerPrefixes?.length
+    ? account.groupTriggerPrefixes
+    : ["/openclaw", "/ask", "@openclaw"];
+  for (const prefix of prefixes) {
+    if (trimmed === prefix) return "";
+    if (trimmed.startsWith(`${prefix} `)) return trimmed.slice(prefix.length).trim();
+  }
+  return text;
+}
+
 async function deliverMaxReply(params: {
   payload: OutboundReplyPayload;
   chatId: string;
@@ -40,26 +79,22 @@ async function deliverMaxReply(params: {
 }): Promise<void> {
   const { payload, chatId, account } = params;
 
-  const api = getApi(account.token);
+  const token = resolveMaxToken(account);
+  const api = getApi(token);
   if (!api) {
     throw new Error("Max API client not available for outbound delivery");
   }
 
-  const numericChatId = Number(chatId);
+  const numericChatId = resolvePositiveIntegerId(chatId, "Max chat id");
   const mediaUrls = resolveOutboundMediaUrls(payload);
 
   // Send media files first — use rawUpload for all types to avoid SDK token bugs with Buffers
   for (const url of mediaUrls) {
     try {
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      const buf = Buffer.from(await res.arrayBuffer());
-      const contentType = res.headers.get("content-type") || "";
+      const downloaded = await fetchBufferWithLimit(url, account.maxDownloadBytes);
       const urlFilename = url.split("/").pop()?.split("?")[0] || "file";
-
-      const uploadType = resolveUploadType(undefined, contentType);
-
-      const attachment = await rawUpload(api, uploadType, buf, urlFilename);
+      const uploadType = resolveUploadType(undefined, downloaded.contentType);
+      const attachment = await rawUpload(api, uploadType, downloaded.buffer, urlFilename);
       await api.sendMessageToChat(numericChatId, "", {
         attachments: [attachment],
       });
@@ -68,30 +103,36 @@ async function deliverMaxReply(params: {
     }
   }
 
-  // Extract local file paths from text and send them as attachments
   let text = payload.text?.trim() ?? "";
-  const filePathRegex = /(?:^|\s)(\/[\w/._ -]+\.[\w]+)/g;
-  let match: RegExpExecArray | null;
-  const filePaths: string[] = [];
-  while ((match = filePathRegex.exec(text)) !== null) {
-    const fp = match[1].trim();
-    if (fs.existsSync(fp)) {
-      filePaths.push(fp);
-    }
-  }
 
-  for (const fp of filePaths) {
-    try {
-      const filename = path.basename(fp);
-      const ext = path.extname(fp).toLowerCase();
-      const uploadType = resolveUploadType(ext);
-      const attachment = await rawUpload(api, uploadType, fp, filename);
-      await api.sendMessageToChat(numericChatId, uploadType === "file" ? filename : "", {
-        attachments: [attachment],
-      });
-      text = text.replace(fp, `[📎 ${filename}]`);
-    } catch {
-      // Keep the path in text if sending fails
+  // Disabled by default. Auto-uploading absolute paths can leak local configs/secrets.
+  if (account.autoSendLocalFiles) {
+    const filePathRegex = /(?:^|\s)(\/[\w/._ -]+\.[\w]+)/g;
+    let match: RegExpExecArray | null;
+    const filePaths: string[] = [];
+    while ((match = filePathRegex.exec(text)) !== null) {
+      const fp = match[1].trim();
+      try {
+        const safePath = assertLocalFileAllowed(fp, account);
+        if (fs.existsSync(safePath)) filePaths.push(safePath);
+      } catch {
+        // Ignore unsafe paths and leave them as text.
+      }
+    }
+
+    for (const fp of filePaths) {
+      try {
+        const filename = path.basename(fp);
+        const ext = path.extname(fp).toLowerCase();
+        const uploadType = resolveUploadType(ext);
+        const attachment = await rawUpload(api, uploadType, fp, filename);
+        await api.sendMessageToChat(numericChatId, uploadType === "file" ? filename : "", {
+          attachments: [attachment],
+        });
+        text = text.replace(fp, `[📎 ${filename}]`);
+      } catch {
+        // Keep the path in text if sending fails
+      }
     }
   }
 
@@ -110,6 +151,16 @@ export async function handleMaxInbound(params: {
   const core = getMaxRuntime();
 
   let rawBody = message.text?.trim() ?? "";
+  const isGroup = message.isGroup ?? false;
+  const senderId = message.userId;
+  const senderName = message.displayName ?? message.username ?? senderId;
+  const chatId = message.chatId;
+
+  if (isGroup) {
+    if (!isAllowedGroupChat(account, chatId)) return;
+    if (!shouldHandleGroupMessage(account, rawBody)) return;
+    rawBody = stripGroupCommand(account, rawBody);
+  }
 
   // Handle inbound file attachments — download and add context for the agent
   if (message.attachments?.length) {
@@ -117,15 +168,10 @@ export async function handleMaxInbound(params: {
     for (const att of message.attachments) {
       if (att.url) {
         try {
-          const res = await fetch(att.url);
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer());
-            const filename = att.filename || att.type || "file";
-            const savedPath = await saveInboundFile(core, buf, filename, accountId);
-            fileDescriptions.push(`[Attached ${att.type}: ${filename}, saved to: ${savedPath}]`);
-          } else {
-            fileDescriptions.push(`[Attached ${att.type}: ${att.filename || att.type} (download failed)]`);
-          }
+          const downloaded = await fetchBufferWithLimit(att.url, account.maxDownloadBytes);
+          const filename = att.filename || att.type || "file";
+          const savedPath = await saveInboundFile(core, downloaded.buffer, filename, accountId);
+          fileDescriptions.push(`[Attached ${att.type}: ${filename}, saved to: ${savedPath}]`);
         } catch {
           fileDescriptions.push(`[Attached ${att.type}: ${att.filename || att.type} (download failed)]`);
         }
@@ -143,13 +189,9 @@ export async function handleMaxInbound(params: {
   }
 
   const cfg = core.config.loadConfig() as OpenClawConfig;
-  const isGroup = message.isGroup ?? false;
-  const senderId = message.userId;
-  const senderName = message.displayName ?? message.username ?? senderId;
-  const chatId = message.chatId;
 
   // --- Access control: check DM policy / pairing ---
-  // Max bots live in group-style chats, so apply policy regardless of isGroup
+  // Max private bot chats may appear as group-style chats, so apply user policy regardless of SDK chat type.
   const dmPolicy = account.dmPolicy;
   if (dmPolicy && dmPolicy !== "open") {
     const pairing = createScopedPairingAccess({
@@ -174,7 +216,7 @@ export async function handleMaxInbound(params: {
     });
 
     if (decision === "pairing") {
-      const api = getApi(account.token);
+      const api = getApi(resolveMaxToken(account));
       await issuePairingChallenge({
         channel: CHANNEL_ID,
         senderId: String(senderId),
@@ -186,7 +228,7 @@ export async function handleMaxInbound(params: {
           }),
         sendPairingReply: async (text: string) => {
           if (api) {
-            await api.sendMessageToChat(Number(chatId), text);
+            await api.sendMessageToChat(resolvePositiveIntegerId(chatId, "Max chat id"), text);
           }
         },
       });
@@ -198,20 +240,18 @@ export async function handleMaxInbound(params: {
     }
   }
 
-  // For routing, use senderId as peer ID — Max bot chats appear as groups
-  // but are effectively 1:1 conversations, and we route by sender
+  // Use senderId for 1:1-like Max bot chats and chatId for explicit groups.
   const route = core.channel.routing.resolveAgentRoute({
     cfg,
     channel: CHANNEL_ID,
     accountId,
-    peer: {
-      kind: "direct",
-      id: senderId,
-    },
+    peer: isGroup
+      ? { kind: "group", id: chatId }
+      : { kind: "direct", id: senderId },
   });
 
   const fromLabel = isGroup
-    ? `group:${chatId}`
+    ? `group:${chatId}/${senderName}`
     : senderName || `user:${senderId}`;
 
   const storePath = core.channel.session.resolveStorePath(
