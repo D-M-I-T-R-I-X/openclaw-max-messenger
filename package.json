@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "OpenClaw channel plugin for Max Messenger (max.ru) — connect AI agents to Max via Bot API",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/alexeyavdey/openclaw-max-messenger.git"
@@ -18,7 +18,7 @@
   ],
   "openclaw": {
     "extensions": [
-      "./src/index.ts"
+      "./dist/index.js"
     ],
     "channel": {
       "id": "max",
@@ -38,6 +38,8 @@
     }
   },
   "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest"
   },
