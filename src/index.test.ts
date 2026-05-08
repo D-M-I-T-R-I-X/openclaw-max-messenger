@@ -6,7 +6,7 @@ import { clearRegistry } from "./registry.js";
 
 describe("plugin object", () => {
   it("has correct id and name", () => {
-    expect(plugin.id).toBe("panty-max");
+    expect(plugin.id).toBe("openclaw-max-messenger");
     expect(plugin.name).toBe("Max Messenger");
   });
 
@@ -14,14 +14,22 @@ describe("plugin object", () => {
     expect(plugin.configSchema).toBeDefined();
   });
 
-  it("register calls registerChannel", () => {
+  it("register calls registerChannel and registerTool", () => {
     const registerChannel = vi.fn();
+    const registerTool = vi.fn();
     const mockApi = {
+      logger: {
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
       runtime: {
         config: { loadConfig: vi.fn() },
         channel: { routing: {}, session: {}, reply: {} },
       },
       registerChannel,
+      registerTool,
     } as any;
 
     plugin.register(mockApi);
@@ -29,6 +37,7 @@ describe("plugin object", () => {
     expect(registerChannel).toHaveBeenCalledWith({
       plugin: maxChannel,
     });
+    expect(registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "max_send_file" }));
   });
 });
 
@@ -61,7 +70,7 @@ describe("maxChannel", () => {
         max: {
           accounts: {
             default: { token: "tok-1" },
-            secondary: { token: "tok-2" },
+            secondary: { tokenEnv: "MAX_SECONDARY_TOKEN" },
           },
         },
       },
@@ -78,12 +87,14 @@ describe("maxChannel", () => {
 
     it("resolveAccount returns correct account", () => {
       const account = maxChannel.config.resolveAccount(cfg, "secondary");
-      expect(account.token).toBe("tok-2");
+      expect(account.tokenEnv).toBe("MAX_SECONDARY_TOKEN");
+      expect(account.accountId).toBe("secondary");
     });
 
     it("resolveAccount defaults to 'default'", () => {
       const account = maxChannel.config.resolveAccount(cfg);
       expect(account.token).toBe("tok-1");
+      expect(account.accountId).toBe("default");
     });
 
     it("resolveAccount throws for unknown account", () => {
@@ -106,36 +117,35 @@ describe("maxChannel", () => {
       expect(maxChannel.outbound.sendMedia).toBeTypeOf("function");
     });
 
-    it("sendText throws when bot is not started", async () => {
+    it("sendText throws when bot is not started for the requested account", async () => {
       await expect(
         maxChannel.outbound.sendText({
           text: "hello",
           accountId: "default",
           chatId: "123",
-          account: { token: "no-such-token" },
+          account: { accountId: "default", token: "no-such-token" },
         })
-      ).rejects.toThrow("Bot not started");
+      ).rejects.toThrow('Bot not started for Max account "default"');
     });
 
-    it("sendMedia throws when source is missing for non-image types", async () => {
-      // Register a mock bot so requireApi passes
+    it("sendMedia throws when media URL is missing", async () => {
       const { registerBot } = await import("./registry.js");
       const mockApi = {
-        uploadAudio: vi.fn(),
+        raw: { uploads: { getUploadUrl: vi.fn() } },
         sendMessageToChat: vi.fn(),
       };
       const mockBot = { api: mockApi } as any;
-      registerBot("test-tok", mockBot);
+      registerBot("test-tok", mockBot, "default");
 
       await expect(
         maxChannel.outbound.sendMedia({
           accountId: "default",
           chatId: "123",
-          account: { token: "test-tok" },
+          account: { accountId: "default", token: "test-tok" },
           type: "audio",
-          // no source, no url
+          // no mediaUrl, no url
         })
-      ).rejects.toThrow('requires "source"');
+      ).rejects.toThrow("No media URL provided");
     });
   });
 
@@ -150,11 +160,11 @@ describe("maxChannel", () => {
         maxChannel.gateway.startAccount({
           cfg: {},
           accountId: "test",
-          account: { token: "" },
+          account: {},
           runtime: {},
           abortSignal: abortController.signal,
         })
-      ).rejects.toThrow("missing token");
+      ).rejects.toThrow("missing bot token");
     });
   });
 });
