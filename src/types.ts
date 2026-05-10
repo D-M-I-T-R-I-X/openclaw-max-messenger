@@ -1,10 +1,29 @@
 export interface MaxAccountConfig {
-  token: string;
+  /** Prefer tokenEnv for production deployments. token remains supported for compatibility. */
+  token?: string;
+  tokenEnv?: string;
   botId?: string;
   allowedUpdates?: string[];
   accountId?: string | null;
   dmPolicy?: string;
   allowFrom?: Array<string | number>;
+  /** Optional allow-list for group chat ids. Empty/undefined means no group chat restriction. */
+  allowChats?: Array<string | number>;
+  /**
+   * Group handling policy. Defaults to "always" for compatibility with Max private chats
+   * that may appear as group-style chats in the SDK.
+   */
+  respondInGroups?: "never" | "command" | "always";
+  /** Command prefixes used when respondInGroups is "command". */
+  groupTriggerPrefixes?: string[];
+  /** Opt-in only: auto-upload absolute local file paths found in agent replies. */
+  autoSendLocalFiles?: boolean;
+  /** Directories from which local files may be uploaded by this plugin/tool. */
+  allowedFileRoots?: string[];
+  /** Maximum bytes to download from inbound/outbound URLs. Defaults to 25 MiB. */
+  maxDownloadBytes?: number;
+  /** Maximum bytes to upload from local files. Defaults to 25 MiB. */
+  maxUploadBytes?: number;
 }
 
 export interface MaxChannelsConfig {

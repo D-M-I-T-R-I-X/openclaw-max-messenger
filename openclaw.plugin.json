@@ -1,17 +1,115 @@
 {
   "id": "openclaw-max-messenger",
   "name": "Max Messenger",
+  "description": "OpenClaw channel plugin for Max Messenger via Bot API.",
   "version": "0.1.0",
-  "description": "Channel plugin for Max Messenger (max.ru) via Bot API",
-  "author": "alexonic",
-  "engines": {
-    "openclaw": ">=0.1.0"
-  },
-  "extensions": ["./src/index.ts"],
   "channels": ["max"],
+  "channelEnvVars": {
+    "max": ["MAX_BOT_TOKEN"]
+  },
+  "activation": {
+    "onStartup": true,
+    "onChannels": ["max"],
+    "onCapabilities": ["channel", "tool"]
+  },
+  "contracts": {
+    "tools": ["max_send_file"]
+  },
   "configSchema": {
     "type": "object",
-    "properties": {},
-    "additionalProperties": false
+    "additionalProperties": true,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "max": {
+      "label": "Max Messenger",
+      "description": "Max Messenger bot integration via Bot API.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "accounts": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "token": { "type": "string" },
+                "tokenEnv": { "type": "string" },
+                "botId": { "type": "string" },
+                "allowedUpdates": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "dmPolicy": { "type": "string" },
+                "allowFrom": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      { "type": "string" },
+                      { "type": "number" }
+                    ]
+                  }
+                },
+                "allowChats": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      { "type": "string" },
+                      { "type": "number" }
+                    ]
+                  }
+                },
+                "respondInGroups": {
+                  "type": "string",
+                  "enum": ["never", "command", "always"]
+                },
+                "groupTriggerPrefixes": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "autoSendLocalFiles": { "type": "boolean" },
+                "allowedFileRoots": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "maxDownloadBytes": { "type": "number" },
+                "maxUploadBytes": { "type": "number" }
+              }
+            }
+          }
+        }
+      },
+      "uiHints": {
+        "accounts": {
+          "label": "Accounts",
+          "help": "Map of Max bot account ids to Bot API credentials and access policy. Prefer tokenEnv over token."
+        },
+        "token": {
+          "label": "Bot token",
+          "sensitive": true,
+          "help": "Prefer tokenEnv for production."
+        },
+        "tokenEnv": {
+          "label": "Bot token environment variable",
+          "placeholder": "MAX_BOT_TOKEN"
+        },
+        "dmPolicy": {
+          "label": "DM access policy",
+          "help": "Use allowlist or pairing for personal deployments."
+        },
+        "allowFrom": {
+          "label": "Allowed Max user ids"
+        },
+        "allowedFileRoots": {
+          "label": "Allowed local file roots",
+          "advanced": true
+        },
+        "autoSendLocalFiles": {
+          "label": "Auto-send local file paths from replies",
+          "advanced": true
+        }
+      }
+    }
   }
 }

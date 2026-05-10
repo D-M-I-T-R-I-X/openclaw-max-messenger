@@ -1,38 +1,87 @@
 import fs from "node:fs";
 import path from "node:path";
-import { getAllBots } from "./registry.js";
-import { rawUpload, resolveUploadType } from "./upload-file.js";
+import { getApiByAccount } from "./registry.js";
+import { assertLocalFileAllowed, rawUpload, resolveUploadType, resolvePositiveIntegerId } from "./upload-file.js";
+import type { MaxAccountConfig } from "./types.js";
 
-let lastUsedContext: { chatId: number; accountToken: string } | undefined;
-
-export function recordLastUsedContext(chatId: number, accountToken: string): void {
-  lastUsedContext = { chatId, accountToken };
+interface ChatContext {
+  accountId: string;
+  chatId: string;
+  userId?: string;
+  account: MaxAccountConfig;
+  updatedAt: number;
 }
 
-function resolveContext(): { chatId: number; api: ReturnType<typeof getAllBots>[0]["api"] } | null {
-  if (!lastUsedContext) return null;
-  const bot = getAllBots().find(b => b.api !== undefined);
-  if (!bot) return null;
-  return { chatId: lastUsedContext.chatId, api: bot.api };
+const recentContexts = new Map<string, ChatContext>();
+
+function contextKey(accountId: string, chatId: string, userId?: string): string {
+  return `${accountId}:${chatId}:${userId ?? ""}`;
+}
+
+export function recordLastUsedContext(params: {
+  accountId: string;
+  chatId: string;
+  userId?: string;
+  account: MaxAccountConfig;
+}): void {
+  recentContexts.set(contextKey(params.accountId, params.chatId, params.userId), {
+    ...params,
+    updatedAt: Date.now(),
+  });
+}
+
+export function clearRecordedContexts(accountId?: string): void {
+  for (const [key, value] of recentContexts) {
+    if (!accountId || value.accountId === accountId) recentContexts.delete(key);
+  }
+}
+
+function resolveContext(params: Record<string, unknown>): ChatContext | null {
+  const accountId = String(params.account_id ?? params.accountId ?? "").trim();
+  const chatId = String(params.chat_id ?? params.chatId ?? "").trim();
+  const userId = String(params.user_id ?? params.userId ?? "").trim() || undefined;
+
+  if (accountId && chatId) {
+    const exact = recentContexts.get(contextKey(accountId, chatId, userId));
+    const byChat = exact ?? Array.from(recentContexts.values()).find(
+      (ctx) => ctx.accountId === accountId && ctx.chatId === chatId,
+    );
+    return byChat ?? null;
+  }
+
+  if (recentContexts.size === 1) {
+    return Array.from(recentContexts.values())[0];
+  }
+
+  const ordered = Array.from(recentContexts.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+  return ordered[0] ?? null;
 }
 
 export const sendFileTool = {
   name: "max_send_file",
   label: "Send File",
   description:
-    "Send a file from the local filesystem to the current chat. " +
-    "Use this when the user asks you to send, share, or deliver a file. " +
-    "Supports any file type: PDF, images, documents, archives, etc.",
+    "Send a file from an allowed local export/workspace directory to a Max chat. " +
+    "Prefer passing account_id and chat_id from the current Max context. " +
+    "Supports PDF, images, documents, archives, etc.",
   parameters: {
     type: "object" as const,
     properties: {
       file_path: {
         type: "string" as const,
-        description: "Absolute path to the file to send",
+        description: "Absolute path to the file to send. Must be under allowedFileRoots.",
       },
       caption: {
         type: "string" as const,
         description: "Optional message to send with the file",
+      },
+      account_id: {
+        type: "string" as const,
+        description: "Optional Max account id. Safer than relying on recent chat context.",
+      },
+      chat_id: {
+        type: "string" as const,
+        description: "Optional Max chat id. Safer than relying on recent chat context.",
       },
     },
     required: ["file_path"],
@@ -45,22 +94,33 @@ export const sendFileTool = {
       };
     }
 
-    const resolved = resolveContext();
+    const resolved = resolveContext(params);
     if (!resolved) {
       return {
-        content: [{ type: "text" as const, text: "Error: no active chat context — cannot determine where to send the file" }],
+        content: [{
+          type: "text" as const,
+          text: "Error: no active Max chat context. Provide account_id and chat_id explicitly.",
+        }],
       };
     }
 
-    const { chatId, api } = resolved;
-    const caption = String(params.caption ?? "").trim();
-    const filename = path.basename(filePath);
-    const ext = path.extname(filePath).toLowerCase();
-    const uploadType = resolveUploadType(ext);
+    const api = getApiByAccount(resolved.accountId);
+    if (!api) {
+      return {
+        content: [{ type: "text" as const, text: `Error: Max bot is not running for account ${resolved.accountId}` }],
+      };
+    }
 
     try {
-      const attachment = await rawUpload(api, uploadType, filePath, filename);
-      const fileSize = fs.statSync(filePath).size;
+      const safePath = assertLocalFileAllowed(filePath, resolved.account);
+      const chatId = resolvePositiveIntegerId(resolved.chatId, "Max chat id");
+      const caption = String(params.caption ?? "").trim();
+      const filename = path.basename(safePath);
+      const ext = path.extname(safePath).toLowerCase();
+      const uploadType = resolveUploadType(ext);
+      const attachment = await rawUpload(api, uploadType, safePath, filename);
+      const fileSize = fs.statSync(safePath).size;
+
       await api.sendMessageToChat(chatId, caption || filename, {
         attachments: [attachment],
       });
